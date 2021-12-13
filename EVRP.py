@@ -1,3 +1,4 @@
+from typing import List, Dict
 from gurobipy import *
 import pandas as pd
 import numpy as np
@@ -34,22 +35,42 @@ def read_data(path):
 
 
 class NetWork:
-    __slots__ = ('G', 'solve_mode', 'loc', 'route')
+    __slots__ = ('G', 'mod_G', 'loc', 'mod_loc', 'solve_mode', 'route')
 
     def __init__(self, nodes, edges):
-        self.G, self.loc = self._init_graph(nodes, edges)
+        self.G, self.loc, self.mod_G, self.mod_loc = self._init_graph(nodes, edges)
         self.solve_mode = 'Gurobi'  # 默认gurobi求解
         self.route = None
 
     @staticmethod
     def _init_graph(nodes: pd.DataFrame, edges: pd.DataFrame):
         g = nx.DiGraph()  # Warning: Graph create undirected graph
+        mod_g = nx.DiGraph()
         append_nodes = list(map(lambda x: (x[1], {'charger': x[4], 'price': x[5]}), nodes.itertuples()))
         g.add_nodes_from(append_nodes)
         g.add_weighted_edges_from(
             [tuple(edge[1:]) for edge in edges.itertuples()])  # attribute weight refers to distance
         loc = dict(map(lambda x: (x[1], (x[2], x[3])), nodes.itertuples()))
-        return g, loc
+
+        # construct modified graph
+        key_nodes = nodes.loc[nodes['charger'] != 0].reset_index(drop=True)
+        append_key_nodes = list(map(lambda x: (x[1], {'charger': x[4], 'price': x[5]}), key_nodes.itertuples()))
+        mod_g.add_nodes_from(append_key_nodes)
+        key_edges = []
+        for i in range(len(mod_g.nodes)):
+            for j in range(i + 1, len(mod_g.nodes)):
+                source_node = key_nodes['point'][i]
+                target_node = key_nodes['point'][j]
+                if nx.has_path(g, source=source_node, target=target_node):
+                    # 小于电车单次最远行驶距离的可充电节点才可连通
+                    modified_dis = nx.shortest_path_length(g, source=source_node, target=target_node, weight='weight')
+                    if modified_dis <= (ELEC_CAPACITY - ELEC_MIN) / ELEC_CONS_RATE:
+                        key_edges.append((source_node, target_node, modified_dis))
+        mod_g.add_weighted_edges_from(key_edges)
+        mod_loc = dict(map(lambda x: (x[1], (x[2], x[3])), key_nodes.itertuples()))
+        # nx.draw(mod_g, mod_loc)
+        # plt.show()
+        return g, loc, mod_g, mod_loc
 
     @prompt_display
     def solve_single_by_gurobi(self):
@@ -210,6 +231,10 @@ class NetWork:
                 shortest_path_list.append(edge)
         return shortest_path_list
 
+    def solve_by_benders_decomposition(self):
+        bddc = Bender_Decomposition(self.mod_G)
+        bddc.master_problem()
+
     def network_display(self, mode='2dim'):
         if mode == '2dim':
             color = {
@@ -229,6 +254,99 @@ class NetWork:
             pass
 
 
+class Bender_Decomposition:
+    def __init__(self, graph: nx.DiGraph):
+        self.G = graph
+        self.MP = Model()
+        self.route = tupledict()
+        self.SP = Model()
+
+    def master_problem(self):
+        # TODO：MP 由最短路算法生成初始路径，SP求解结果存在错误
+        mp = self.MP
+        g = self.G
+        init_node_of_path = nx.shortest_path(self.G, source=0, target=90, weight='weight')
+        init_path = []
+        for i in range(len(init_node_of_path) - 1):
+            init_path.append((init_node_of_path[i], init_node_of_path[i + 1]))
+
+        print(init_path)
+        x_var_dict = mp.addVars(g.edges, vtype=GRB.BINARY, name='x')
+        for edge in g.edges:
+            x_var_dict[edge].setAttr('Start', 1 if edge in init_path else 0)
+        mp.update()
+        self.sub_problem(x_var_dict)
+
+    def sub_problem(self, x_var_dict: tupledict):
+        g = self.G
+        sp = Model()
+        sp.Params.InfUnbdInfo = 1  # 设置后能输出极方向
+        q_var_dict = sp.addVars(g.nodes, vtype=GRB.CONTINUOUS, name='q', ub=100, lb=0)
+        e_var_dict = sp.addVars(g.nodes, vtype=GRB.CONTINUOUS, name='e', ub=100, lb=0)
+        r_var_dict = sp.addVars(g.nodes, vtype=GRB.BINARY, name='r')
+        s_var_dict = sp.addVars(g.nodes, vtype=GRB.CONTINUOUS, name='s', ub=100, lb=0)
+
+        # add objective function
+        node_with_charger = [node[0] for node in g.nodes.data() if node[1]['charger'] == 1]
+        price_coeff = tupledict(
+            map(lambda node: (node[0], node[1]['price'] + VALUE_OF_TIME / CHARGING_RATE), g.nodes.data()))
+        obj = e_var_dict.prod(price_coeff, node_with_charger) + REPLACE_FEE * r_var_dict.sum('*')
+        sp.setObjective(obj, GRB.MINIMIZE)
+
+        # add constraints
+        constrs: List[Constr] = []
+        for node, para in g.nodes.data():
+            if para['charger'] >= 0:
+                node_indicator = sum([x_var_dict[edge].Start for edge in g.in_edges(node)])
+                # lower bound of SOC
+                constrs.append(
+                    sp.addConstr(node_indicator * ELEC_MIN <= s_var_dict[node], name='minimum soc in node %d' % node))
+                constrs.append(sp.addConstr(node_indicator * BIG_M >= s_var_dict[node], name=''))
+
+                # equation of SOC
+                for i, j, d in g.in_edges(node, data='weight'):
+                    if x_var_dict[(i, j)].Start > 0.99:
+                        constrs.append(sp.addConstr(
+                            quicksum([s_var_dict[i], - ELEC_CONS_RATE * d, q_var_dict[i]]) == s_var_dict[node],
+                            name='soc in node %d' % node))
+            else:
+                # origin node power constraint
+                constrs.append(sp.addConstr(s_var_dict[node] == ELEC_CAPACITY, name=''))
+
+            # charging constraint
+            if para['charger'] == 1:
+                constrs.append(sp.addConstr(q_var_dict[node] <= ELEC_CAPACITY - s_var_dict[node], name=''))
+
+                # replacement indicator
+                constrs.append(
+                    sp.addConstr(q_var_dict[node] >= ELEC_CAPACITY - s_var_dict[node] - BIG_M * (1 - r_var_dict[node]),
+                                 name=''))
+
+                # charging fee
+                constrs.append(sp.addConstr(e_var_dict[node] <= BIG_M * (1 - r_var_dict[node]), name=''))
+                constrs.append(sp.addConstr(e_var_dict[node] >= q_var_dict[node] - BIG_M * r_var_dict[node], name=''))
+            else:
+                constrs.append(sp.addConstr(q_var_dict[node] == 0, name=''))
+
+        sp.update()
+        print('约束数量%d' % len(sp.getConstrs()))
+        # print(constrs)
+        # print('变量数量%d' % len(sp.getVars()))
+        sp.optimize()
+
+        # add benders_cut
+        if sp.status == GRB.Status.OPTIMAL:
+            pass
+        elif sp.status == GRB.Status.INFEASIBLE:
+            # not available for discontinuous model
+            raise Exception('MP is infeasible')
+            for constr in constrs:
+                print(type(constr))
+                print(constr.getAttr('FarkasDual'))
+        else:
+            raise Exception('sth went wrong')
+
+
 if __name__ == '__main__':
     raw_node = pd.read_csv(NODE_PATH, encoding='utf8')
     raw_path = pd.read_csv(EDGE_PATH, encoding='utf8')
@@ -239,5 +357,7 @@ if __name__ == '__main__':
     raw_path['point1'] = raw_path['point1'].astype('int')
     raw_path['point2'] = raw_path['point2'].astype('int')
     network = NetWork(raw_node, raw_path)
+    network.solve_by_benders_decomposition()
+    exit()
     network.solve_alternative_by_gurobi()
     network.network_display()
