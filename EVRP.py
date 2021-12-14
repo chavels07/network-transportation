@@ -11,7 +11,7 @@ ELEC_CAPACITY = 100  # 电池容量
 ELEC_CONS_RATE = 0.2  # 每公里电量消耗率
 ELEC_MIN = 5  # 电池最小剩余量
 COST_PER_DIS = 0.5
-VALUE_OF_TIME = 0.1
+VALUE_OF_TIME = 0.5
 CHARGING_RATE = 0.1  # TODO:修正
 REPLACE_FEE = 0.01
 SPEED = 50
@@ -83,12 +83,12 @@ class NetWork:
 
         # add variables
         x_var_dict = m.addVars(g.edges, vtype=GRB.BINARY, name='x')
-        e_var_dict = m.addVars(g.nodes, vtype=GRB.CONTINUOUS, name='e', ub=100, lb=ELEC_MIN - 100)
+        e_var_dict = m.addVars(g.nodes, vtype=GRB.CONTINUOUS, name='e', ub=100, lb=0)  # ELEC_MIN - 100
         s_var_dict = m.addVars(g.nodes, vtype=GRB.CONTINUOUS, name='s', ub=100, lb=0)
 
         # add objective function
         node_with_charger = [node[0] for node in g.nodes.data() if node[1]['charger'] == 1]
-        price_coeff = tupledict(map(lambda node: (node[0], node[1]['price']), g.nodes.data()))
+        price_coeff = tupledict(map(lambda node: (node[0], node[1]['price'] + VALUE_OF_TIME / CHARGING_RATE), g.nodes.data()))
         dis_coeff = tupledict(map(lambda edge: ((edge[0], edge[1]), edge[2]['weight'] * COST_PER_DIS), g.edges.data()))
         obj = e_var_dict.prod(price_coeff, node_with_charger) + x_var_dict.prod(dis_coeff, '*')
         m.setObjective(obj, GRB.MINIMIZE)
@@ -127,7 +127,7 @@ class NetWork:
             # charging constraint
             if para['charger'] == 1:
                 m.addConstr(e_var_dict[node] <= ELEC_CAPACITY - s_var_dict[node], name='')
-                m.addConstr(e_var_dict[node] >= -(s_var_dict[node] - ELEC_MIN), name='')
+                # m.addConstr(e_var_dict[node] >= -(s_var_dict[node] - ELEC_MIN), name='')
             else:
                 m.addConstr(e_var_dict[node] == 0, name='')
 
@@ -143,7 +143,7 @@ class NetWork:
                 print(x_var_dict[edge])
             for node in g.nodes:
                 print(node, end='    ')
-                print(s_var_dict[node])
+                print(e_var_dict[node])
 
     @prompt_display
     def solve_alternative_by_gurobi(self):
@@ -193,10 +193,17 @@ class NetWork:
                 m.addConstr(x_var_dict.sum('*', node) * BIG_M >= s_var_dict[node], name='')
 
                 # equation of SOC
-                expr_comp = []
+                # expr_comp = []
+                # for i, j, d in g.in_edges(node, data='weight'):
+                #     expr_comp.append(x_var_dict[i, j] * quicksum([s_var_dict[i], - ELEC_CONS_RATE * d, q_var_dict[i]]))
+                # m.addConstr(quicksum(expr_comp) == s_var_dict[node], name='soc in node %d' % node)
+
+                # linearize the constraints
                 for i, j, d in g.in_edges(node, data='weight'):
-                    expr_comp.append(x_var_dict[i, j] * quicksum([s_var_dict[i], - ELEC_CONS_RATE * d, q_var_dict[i]]))
-                m.addConstr(quicksum(expr_comp) == s_var_dict[node], name='soc in node %d' % node)
+                    m.addConstr(s_var_dict[j] - s_var_dict[i] <= q_var_dict[i] - ELEC_CONS_RATE * d + BIG_M * (
+                            1 - x_var_dict[(i, j)]), name='')
+                    m.addConstr(s_var_dict[j] - s_var_dict[i] >= q_var_dict[i] - ELEC_CONS_RATE * d - BIG_M * (
+                            1 - x_var_dict[(i, j)]), name='')
 
             else:
                 # origin node power constraint
@@ -231,11 +238,13 @@ class NetWork:
                 shortest_path_list.append(edge)
         return shortest_path_list
 
+    @prompt_display
     def solve_by_benders_decomposition(self):
+        # self.network_display()
         bddc = Bender_Decomposition(self.mod_G)
         bddc.master_problem()
 
-    def network_display(self, mode='2dim'):
+    def network_display(self, mode='2dim', modified=False):
         if mode == '2dim':
             color = {
                 -1: '#0000C6',
@@ -262,7 +271,7 @@ class Bender_Decomposition:
         self.SP = Model()
 
     def master_problem(self):
-        # TODO：MP 由最短路算法生成初始路径，SP求解结果存在错误
+        # TODO：MP 由最短路算法生成初始路径
         mp = self.MP
         g = self.G
         init_node_of_path = nx.shortest_path(self.G, source=0, target=90, weight='weight')
@@ -271,33 +280,106 @@ class Bender_Decomposition:
             init_path.append((init_node_of_path[i], init_node_of_path[i + 1]))
 
         print(init_path)
+        # master problem construction
+        # variable
         x_var_dict = mp.addVars(g.edges, vtype=GRB.BINARY, name='x')
-        for edge in g.edges:
-            x_var_dict[edge].setAttr('Start', 1 if edge in init_path else 0)
-        mp.update()
-        self.sub_problem(x_var_dict)
+        row_var = mp.addVar(vtype=GRB.CONTINUOUS, obj=1, lb=0, name='row', column=None)
 
-    def sub_problem(self, x_var_dict: tupledict):
+        # objective function
+        dis_coeff = tupledict(map(lambda edge: ((edge[0], edge[1]), edge[2]['weight'] * COST_PER_DIS), g.edges.data()))
+        mp.setObjective(x_var_dict.prod(dis_coeff) + row_var, GRB.MINIMIZE)
+
+        # constraint
+        for node, para in g.nodes.data():
+            # unique flow constraints
+            if para['charger'] == -1:
+                right_hand_side_value = 1
+            elif para['charger'] == 2:
+                right_hand_side_value = -1
+            else:
+                right_hand_side_value = 0
+            flow_in_node_cstr = LinExpr()
+            for i, j in g.out_edges(node):
+                flow_in_node_cstr += x_var_dict[i, j]
+            for i, j in g.in_edges(node):
+                flow_in_node_cstr -= x_var_dict[i, j]
+            mp.addConstr(flow_in_node_cstr == right_hand_side_value, name='flow in node %d' % node)
+
+        plane_cutting_constraint: List[LinExpr] = []
+        # iteration
+        while True:
+            mp.update()
+            print('约束数量%d' % len(mp.getConstrs()))
+            mp.optimize()
+            print('row value' + str(row_var.X))
+            print(mp.ObjVal)
+            if mp.Status == GRB.Status.OPTIMAL:
+                # solve sub problem
+                dual_variable, status = self.sub_problem(x_var_dict)
+                print(dual_variable)
+                if status >= 0:
+                    #  optimality cut
+                    if status == 0:
+                        dual_index = iter(range(len(dual_variable)))
+
+                        '''
+                        150个对偶变量
+                        '''
+                        for node, para in g.nodes.data():
+                            if para['charger'] >= 0:
+                                try:
+                                    # lower bound of SOC
+                                    mp.addConstr(
+                                        x_var_dict.sum('*', node) * ELEC_MIN * dual_variable[
+                                            next(dual_index)] <= row_var,
+                                        name='minimum soc in node %d' % node)
+                                    mp.addConstr(x_var_dict.sum('*', node) * BIG_M * dual_variable[
+                                        next(dual_index)] <= row_var, name='')
+
+                                    # equation of SOC
+                                    for i, j, d in g.in_edges(node, data='weight'):
+                                        mp.addConstr(row_var >= dual_variable[next(dual_index)] * (BIG_M * (
+                                                1 - x_var_dict[(i, j)]) - ELEC_CONS_RATE * d), name='')
+                                        mp.addConstr(row_var >= dual_variable[next(dual_index)] * (-BIG_M * (
+                                                1 - x_var_dict[(i, j)]) - ELEC_CONS_RATE * d), name='')
+                                except StopIteration:
+                                    print('index overflow')
+                                    pass
+                        for edge in self.G.edges:
+                            if x_var_dict[edge].X > 0.99:
+                                print(edge)
+
+                    # feasibility cut
+                    else:
+                        boundary_value = 0
+                        for shadow_price in dual_variable:
+                            plane_cutting_constraint.append()
+                    for node, para in g.nodes.data():
+                        if para['charger'] >= 0:
+                            pass
+            elif mp.Status == GRB.Status.INFEASIBLE:
+                raise Exception('master problem infeasible')
+            else:
+                raise Exception('sth went wrong')
+
+    def sub_problem(self, x_var_dict: tupledict) -> (list, int):
         g = self.G
         sp = Model()
         sp.Params.InfUnbdInfo = 1  # 设置后能输出极方向
-        q_var_dict = sp.addVars(g.nodes, vtype=GRB.CONTINUOUS, name='q', ub=100, lb=0)
         e_var_dict = sp.addVars(g.nodes, vtype=GRB.CONTINUOUS, name='e', ub=100, lb=0)
-        r_var_dict = sp.addVars(g.nodes, vtype=GRB.BINARY, name='r')
         s_var_dict = sp.addVars(g.nodes, vtype=GRB.CONTINUOUS, name='s', ub=100, lb=0)
 
         # add objective function
         node_with_charger = [node[0] for node in g.nodes.data() if node[1]['charger'] == 1]
         price_coeff = tupledict(
             map(lambda node: (node[0], node[1]['price'] + VALUE_OF_TIME / CHARGING_RATE), g.nodes.data()))
-        obj = e_var_dict.prod(price_coeff, node_with_charger) + REPLACE_FEE * r_var_dict.sum('*')
-        sp.setObjective(obj, GRB.MINIMIZE)
+        sp.setObjective(e_var_dict.prod(price_coeff, node_with_charger), GRB.MINIMIZE)
 
         # add constraints
         constrs: List[Constr] = []
         for node, para in g.nodes.data():
             if para['charger'] >= 0:
-                node_indicator = sum([x_var_dict[edge].Start for edge in g.in_edges(node)])
+                node_indicator = sum([x_var_dict[edge].X for edge in g.in_edges(node)])
                 # lower bound of SOC
                 constrs.append(
                     sp.addConstr(node_indicator * ELEC_MIN <= s_var_dict[node], name='minimum soc in node %d' % node))
@@ -305,46 +387,128 @@ class Bender_Decomposition:
 
                 # equation of SOC
                 for i, j, d in g.in_edges(node, data='weight'):
-                    if x_var_dict[(i, j)].Start > 0.99:
-                        constrs.append(sp.addConstr(
-                            quicksum([s_var_dict[i], - ELEC_CONS_RATE * d, q_var_dict[i]]) == s_var_dict[node],
-                            name='soc in node %d' % node))
+                    flow_in_edge = 1 if x_var_dict[(i, j)].X > 0.99 else 0
+                    constrs.append(
+                        sp.addConstr(s_var_dict[j] - s_var_dict[i] <= e_var_dict[i] - ELEC_CONS_RATE * d + BIG_M * (
+                                1 - flow_in_edge), name=''))
+                    constrs.append(
+                        sp.addConstr(s_var_dict[j] - s_var_dict[i] >= e_var_dict[i] - ELEC_CONS_RATE * d - BIG_M * (
+                                1 - flow_in_edge), name=''))
+
+                # for i, j, d in g.in_edges(node, data='weight'):
+                #     if x_var_dict[(i, j)].X > 0.99:
+                #         constrs.append(sp.addConstr(
+                #             quicksum([s_var_dict[i], - ELEC_CONS_RATE * d, e_var_dict[i]]) == s_var_dict[node],
+                #             name='soc in node %d' % node))
             else:
                 # origin node power constraint
-                constrs.append(sp.addConstr(s_var_dict[node] == ELEC_CAPACITY, name=''))
+                sp.addConstr(s_var_dict[node] == ELEC_CAPACITY, name='')
 
             # charging constraint
             if para['charger'] == 1:
-                constrs.append(sp.addConstr(q_var_dict[node] <= ELEC_CAPACITY - s_var_dict[node], name=''))
-
-                # replacement indicator
-                constrs.append(
-                    sp.addConstr(q_var_dict[node] >= ELEC_CAPACITY - s_var_dict[node] - BIG_M * (1 - r_var_dict[node]),
-                                 name=''))
-
-                # charging fee
-                constrs.append(sp.addConstr(e_var_dict[node] <= BIG_M * (1 - r_var_dict[node]), name=''))
-                constrs.append(sp.addConstr(e_var_dict[node] >= q_var_dict[node] - BIG_M * r_var_dict[node], name=''))
+                sp.addConstr(e_var_dict[node] <= ELEC_CAPACITY - s_var_dict[node], name='')
             else:
-                constrs.append(sp.addConstr(q_var_dict[node] == 0, name=''))
+                sp.addConstr(e_var_dict[node] == 0, name='')
 
         sp.update()
-        print('约束数量%d' % len(sp.getConstrs()))
-        # print(constrs)
-        # print('变量数量%d' % len(sp.getVars()))
         sp.optimize()
 
         # add benders_cut
+        status = -1
         if sp.status == GRB.Status.OPTIMAL:
-            pass
-        elif sp.status == GRB.Status.INFEASIBLE:
-            # not available for discontinuous model
-            raise Exception('MP is infeasible')
+            status = 0
+            dual_variable = []
+            for node in self.G.nodes:
+                if s_var_dict[node].X > 0.1:
+                    print(s_var_dict[node].X)
             for constr in constrs:
-                print(type(constr))
-                print(constr.getAttr('FarkasDual'))
+                # print(constr.getAttr('ConstrName') + str(constr.Pi))
+                dual_variable.append(constr.Pi)
+            return dual_variable, status
+        elif sp.status == GRB.Status.INFEASIBLE:
+            # # not available for discontinuous model
+            # raise Exception('MP is infeasible')
+            status = 1
+            extreme_dir = []
+            for constr in constrs:
+                extreme_dir.append(constr.FarkasDual)
+            return extreme_dir, status
         else:
             raise Exception('sth went wrong')
+
+
+# def sub_problem(self, x_var_dict: tupledict):
+#     g = self.G
+#     sp = Model()
+#     sp.Params.InfUnbdInfo = 1  # 设置后能输出极方向
+#     q_var_dict = sp.addVars(g.nodes, vtype=GRB.CONTINUOUS, name='q', ub=100, lb=0)
+#     e_var_dict = sp.addVars(g.nodes, vtype=GRB.CONTINUOUS, name='e', ub=100, lb=0)
+#     r_var_dict = sp.addVars(g.nodes, vtype=GRB.BINARY, name='r')
+#     s_var_dict = sp.addVars(g.nodes, vtype=GRB.CONTINUOUS, name='s', ub=100, lb=0)
+#
+#     # add objective function
+#     node_with_charger = [node[0] for node in g.nodes.data() if node[1]['charger'] == 1]
+#     price_coeff = tupledict(
+#         map(lambda node: (node[0], node[1]['price'] + VALUE_OF_TIME / CHARGING_RATE), g.nodes.data()))
+#     obj = e_var_dict.prod(price_coeff, node_with_charger) + REPLACE_FEE * r_var_dict.sum('*')
+#     sp.setObjective(obj, GRB.MINIMIZE)
+#
+#     # add constraints
+#     constrs: List[Constr] = []
+#     for node, para in g.nodes.data():
+#         if para['charger'] >= 0:
+#             node_indicator = sum([x_var_dict[edge].Start for edge in g.in_edges(node)])
+#             # lower bound of SOC
+#             constrs.append(
+#                 sp.addConstr(node_indicator * ELEC_MIN <= s_var_dict[node], name='minimum soc in node %d' % node))
+#             constrs.append(sp.addConstr(node_indicator * BIG_M >= s_var_dict[node], name=''))
+#
+#             # equation of SOC
+#             for i, j, d in g.in_edges(node, data='weight'):
+#                 if x_var_dict[(i, j)].Start > 0.99:
+#                     constrs.append(sp.addConstr(
+#                         quicksum([s_var_dict[i], - ELEC_CONS_RATE * d, q_var_dict[i]]) == s_var_dict[node],
+#                         name='soc in node %d' % node))
+#         else:
+#             # origin node power constraint
+#             constrs.append(sp.addConstr(s_var_dict[node] == ELEC_CAPACITY, name=''))
+#
+#         # charging constraint
+#         if para['charger'] == 1:
+#             constrs.append(sp.addConstr(q_var_dict[node] <= ELEC_CAPACITY - s_var_dict[node], name=''))
+#
+#             # replacement indicator
+#             constrs.append(
+#                 sp.addConstr(q_var_dict[node] >= ELEC_CAPACITY - s_var_dict[node] - BIG_M * (1 - r_var_dict[node]),
+#                              name=''))
+#
+#             # charging fee
+#             constrs.append(sp.addConstr(e_var_dict[node] <= BIG_M * (1 - r_var_dict[node]), name=''))
+#             constrs.append(sp.addConstr(e_var_dict[node] >= q_var_dict[node] - BIG_M * r_var_dict[node], name=''))
+#         else:
+#             constrs.append(sp.addConstr(q_var_dict[node] == 0, name=''))
+#
+#     sp.update()
+#     print('约束数量%d' % len(sp.getConstrs()))
+#     # print(constrs)
+#     # print('变量数量%d' % len(sp.getVars()))
+#     sp.optimize()
+#
+#     # add benders_cut
+#     if sp.status == GRB.Status.OPTIMAL:
+#         # print(constrs[2].ConstrName)
+#         # print(constrs[2].getAttr('Pi'))
+#         for constr in constrs:
+#             print(constr.getAttr('ConstrName'))
+#         pass
+#     elif sp.status == GRB.Status.INFEASIBLE:
+#         # not available for discontinuous model
+#         raise Exception('MP is infeasible')
+#         for constr in constrs:
+#             print(type(constr))
+#             print(constr.getAttr('FarkasDual'))
+#     else:
+#         raise Exception('sth went wrong')
 
 
 if __name__ == '__main__':
@@ -357,6 +521,9 @@ if __name__ == '__main__':
     raw_path['point1'] = raw_path['point1'].astype('int')
     raw_path['point2'] = raw_path['point2'].astype('int')
     network = NetWork(raw_node, raw_path)
+    # network.solve_single_by_gurobi()
+    # network.network_display()
+    # exit()
     network.solve_by_benders_decomposition()
     exit()
     network.solve_alternative_by_gurobi()
