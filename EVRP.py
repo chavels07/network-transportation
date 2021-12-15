@@ -1,7 +1,6 @@
-from typing import List, Dict
+from typing import List
 from gurobipy import *
 import pandas as pd
-import numpy as np
 import networkx as nx
 import matplotlib.pyplot as plt
 
@@ -11,7 +10,7 @@ ELEC_CAPACITY = 100  # 电池容量
 ELEC_CONS_RATE = 0.2  # 每公里电量消耗率
 ELEC_MIN = 5  # 电池最小剩余量
 COST_PER_DIS = 0.5
-VALUE_OF_TIME = 50
+VALUE_OF_TIME = 0.5
 CHARGING_RATE = 0.1  # TODO:修正
 REPLACE_FEE = 0.01
 SPEED = 50
@@ -35,11 +34,10 @@ def read_data(path):
 
 
 class NetWork:
-    __slots__ = ('G', 'mod_G', 'loc', 'mod_loc', 'solve_mode', 'route')
+    __slots__ = ('G', 'mod_G', 'loc', 'mod_loc', 'fold_path', 'route')
 
     def __init__(self, nodes, edges):
-        self.G, self.loc, self.mod_G, self.mod_loc = self._init_graph(nodes, edges)
-        self.solve_mode = 'Gurobi'  # 默认gurobi求解
+        self.G, self.loc, self.mod_G, self.mod_loc, self.fold_path = self._init_graph(nodes, edges)
         self.route = None
 
     @staticmethod
@@ -57,6 +55,7 @@ class NetWork:
         append_key_nodes = list(map(lambda x: (x[1], {'charger': x[4], 'price': x[5]}), key_nodes.itertuples()))
         mod_g.add_nodes_from(append_key_nodes)
         key_edges = []
+        fold_path = {}
         for i in range(len(mod_g.nodes)):
             for j in range(i + 1, len(mod_g.nodes)):
                 source_node = key_nodes['point'][i]
@@ -65,12 +64,14 @@ class NetWork:
                     # 小于电车单次最远行驶距离的可充电节点才可连通
                     modified_dis = nx.shortest_path_length(g, source=source_node, target=target_node, weight='weight')
                     if modified_dis <= (ELEC_CAPACITY - ELEC_MIN) / ELEC_CONS_RATE:
+                        fold_shortest_path = nx.shortest_path(g, source=source_node, target=target_node, weight='weight')
+                        fold_path[(source_node, target_node)] = fold_shortest_path
                         key_edges.append((source_node, target_node, modified_dis))
         mod_g.add_weighted_edges_from(key_edges)
         mod_loc = dict(map(lambda x: (x[1], (x[2], x[3])), key_nodes.itertuples()))
         # nx.draw(mod_g, mod_loc)
         # plt.show()
-        return g, loc, mod_g, mod_loc
+        return g, loc, mod_g, mod_loc, fold_path
 
     @prompt_display
     def solve_single_by_gurobi(self):
@@ -139,12 +140,22 @@ class NetWork:
         m.optimize()
         if m.status == GRB.OPTIMAL:
             self.route = self._get_shortest_path(x_var_dict)
-            for edge in g.edges:
-                print(edge, end='    ')
-                print(x_var_dict[edge])
+            # for edge in g.edges:
+            #     print(edge, end='    ')
+            #     print(x_var_dict[edge])
+            charging = {}
             for node in g.nodes:
-                print(node, end='    ')
-                print(e_var_dict[node])
+                if s_var_dict[node].X > 0.1:
+                    charging[node] = e_var_dict[node].X
+            print('total runtime of Gurobi Solver : %2f s' % m.Runtime)
+            print('optimal route is {0}'.format(self.route))
+            print('minimum cost of travelling is {0:d}'.format(int(m.ObjVal)))
+            print('charging amount in each node: {0}'.format(charging))
+            self.network_display()
+        elif m.Status == GRB.Status.INFEASIBLE:
+            raise Exception('master problem infeasible')
+        else:
+            raise Exception('sth went wrong')
 
     @prompt_display
     def solve_alternative_by_gurobi(self):
@@ -240,12 +251,31 @@ class NetWork:
         return shortest_path_list
 
     @prompt_display
-    def solve_by_benders_decomposition(self):
+    def solve_by_benders_decomposition(self, ori_graph=True):
         # self.network_display()
         bddc = Bender_Decomposition(self.mod_G)
-        bddc.master_problem()
+        route, cost, charging = bddc.master_problem()
+        if ori_graph:
+            unfold_route = []
+            for path in route:
+                unfold_path = self.fold_path[path]
+                for index in range(len(unfold_path) - 1):
+                    unfold_route.append((unfold_path[index], unfold_path[index + 1]))
+            print(unfold_route)
+            self.route = unfold_route
+            self.network_display(modified=False)
+            pass
+        else:
+            self.route = route
+            self.network_display(modified=True)
 
     def network_display(self, mode='2dim', modified=False):
+        if not modified:
+            local_g = self.G
+            local_loc = self.loc
+        else:
+            local_g = self.mod_G
+            local_loc = self.mod_loc
         if mode == '2dim':
             color = {
                 -1: '#0000C6',
@@ -253,10 +283,10 @@ class NetWork:
                 1: '#000000',
                 2: '#FF0000'
             }
-            node_color = [color[para['charger']] for _, para in self.G.nodes.data()]
-            edge_color = ['#FF0000' if edge in self.route else '#000000' for edge in self.G.edges]
-            edge_width = [2.5 if edge in self.route else 1.0 for edge in self.G.edges]
-            nx.draw(self.G, pos=self.loc, node_size=50, node_color=node_color,
+            node_color = [color[para['charger']] for _, para in local_g.nodes.data()]
+            edge_color = ['#FF0000' if edge in self.route else '#000000' for edge in local_g.edges]
+            edge_width = [2.5 if edge in self.route else 1.0 for edge in local_g.edges]
+            nx.draw(local_g, pos=local_loc, node_size=50, node_color=node_color,
                     edge_color=edge_color)  # edge_width=edge_width,
             # nx.draw_networkx_edges(self.G, edge_color=)
             plt.show()
@@ -268,19 +298,20 @@ class Bender_Decomposition:
     def __init__(self, graph: nx.DiGraph):
         self.G = graph
         self.MP = Model()
-        self.route = tupledict()
         self.SP = Model()
 
     def master_problem(self):
         # TODO：MP 由最短路算法生成初始路径
         mp = self.MP
+        mp.setParam('OutputFlag', 0)  # 不打印日志
         g = self.G
         init_node_of_path = nx.shortest_path(self.G, source=0, target=90, weight='weight')
         init_path = []
         for i in range(len(init_node_of_path) - 1):
             init_path.append((init_node_of_path[i], init_node_of_path[i + 1]))
 
-        print(init_path)
+        print('initial path is {0}'.format(init_path))
+
         # master problem construction
         # variable
         x_var_dict = mp.addVars(g.edges, vtype=GRB.BINARY, name='x')
@@ -307,110 +338,101 @@ class Bender_Decomposition:
             mp.addConstr(flow_in_node_cstr == right_hand_side_value, name='flow in node %d' % node)
 
         plane_cutting_constraint: List[LinExpr] = []
+        last_dual_variable = None
+        total_runtime = 0  # total run time of Bender's decomposition
         # iteration
         while True:
             mp.update()
-            print('约束数量%d' % len(mp.getConstrs()))
             mp.optimize()
-            print('row value' + str(row_var.X))
-            for edge in self.G.edges:
-                if x_var_dict[edge].X > 0.99:
-                    print(edge)
-            print(mp.ObjVal)
+            total_runtime = total_runtime + mp.Runtime
+
+            # print('row value' + str(row_var.X))
+            # for edge in self.G.edges:
+            #     if x_var_dict[edge].X > 0.99:
+            #         print(edge)
+            # print(mp.ObjVal)
+
             if mp.Status == GRB.Status.OPTIMAL:
                 # solve sub problem
-                dual_variable, status = self.sub_problem(x_var_dict)
-                print(dual_variable)
+                dual_variable, status, sp_runtime = self.sub_problem(x_var_dict)
+                total_runtime = total_runtime + sp_runtime
+
+                # terminate iteration only if the dual variable is exactly the same as the last iteration
+                if last_dual_variable:
+                    flag = True
+                    for dual_index in range(len(dual_variable)):
+                        if dual_variable[dual_index] != last_dual_variable[dual_index]:
+                            flag = False
+                            break
+                    if flag:
+                        break
+                last_dual_variable = dual_variable
+
                 if status >= 0:
                     #  optimality cut
                     if status == 0:
-                        dual_index = iter(range(len(dual_variable)))
-
-                        '''
-                        150个对偶变量
-                        '''
-                        # for node, para in g.nodes.data():
-                        #     if para['charger'] >= 0:
-                        #         try:
-                        #             # lower bound of SOC
-                        #             var = next(dual_index)
-                        #             print('1:' + str(dual_variable[var]))
-                        #             mp.addConstr(
-                        #                 x_var_dict.sum('*', node) * ELEC_MIN * dual_variable[
-                        #                     var] <= row_var,
-                        #                 name='minimum soc in node %d' % node)
-                        #
-                        #             var = next(dual_index)
-                        #             print('2:' + str(dual_variable[var]))
-                        #             mp.addConstr(x_var_dict.sum('*', node) * BIG_M * dual_variable[
-                        #                 var] <= row_var, name='')
-                        #
-                        #             # equation of SOC
-                        #             for i, j, d in g.in_edges(node, data='weight'):
-                        #                 var = next(dual_index)
-                        #                 print('3:' + str(dual_variable[var]))
-                        #                 mp.addConstr(row_var >= dual_variable[var] * (BIG_M * (
-                        #                         1 - x_var_dict[(i, j)]) - ELEC_CONS_RATE * d), name='')
-                        #
-                        #                 var = next(dual_index)
-                        #                 print('4:' + str(dual_variable[var]))
-                        #                 mp.addConstr(row_var >= dual_variable[var] * (-BIG_M * (
-                        #                         1 - x_var_dict[(i, j)]) - ELEC_CONS_RATE * d), name='')
-                        #         except StopIteration:
-                        #             print('index overflow')
-                        #             pass
+                        dual_iter = iter(dual_variable)
                         big_constraint = LinExpr()
                         for node, para in g.nodes.data():
                             if para['charger'] >= 0:
                                 try:
                                     # lower bound of SOC
-                                    var = next(dual_index)
-                                    print('1:' + str(dual_variable[var]))
+                                    # print('1:' + str(dual_variable[var]))
                                     big_constraint = big_constraint + x_var_dict.sum('*', node) * ELEC_MIN * \
-                                                     dual_variable[var]
+                                                     next(dual_iter)
 
-                                    var = next(dual_index)
-                                    print('2:' + str(dual_variable[var]))
+                                    # print('2:' + str(dual_variable[var]))
                                     big_constraint = big_constraint + x_var_dict.sum('*', node) * ELEC_CAPACITY * \
-                                                     dual_variable[var]
+                                                     next(dual_iter)
 
                                     # equation of SOC
                                     for i, j, d in g.in_edges(node, data='weight'):
-                                        var = next(dual_index)
-                                        print('3:' + str(dual_variable[var]))
+                                        # var = next(dual_index)
+                                        # print('3:' + str(dual_variable[var]))
 
-                                        print(dual_variable[var] * (BIG_M * (
-                                                1 - x_var_dict[(i, j)]) - ELEC_CONS_RATE * d))
-                                        print(dual_variable[var])
+                                        # print(dual_variable[var] * (BIG_M * (
+                                        #         1 - x_var_dict[(i, j)]) - ELEC_CONS_RATE * d))
+                                        # print(dual_variable[var])
 
-                                        big_constraint = big_constraint + dual_variable[var] * (BIG_M * (
+                                        big_constraint = big_constraint + next(dual_iter) * (BIG_M * (
                                                 1 - x_var_dict[(i, j)]) - ELEC_CONS_RATE * d)
 
-                                        var = next(dual_index)
-                                        print('4:' + str(dual_variable[var]))
-                                        big_constraint = big_constraint + dual_variable[var] * (-BIG_M * (
+                                        # var = next(dual_index)
+                                        # print('4:' + str(dual_variable[var]))
+                                        big_constraint = big_constraint + next(dual_iter) * (-BIG_M * (
                                                 1 - x_var_dict[(i, j)]) - ELEC_CONS_RATE * d)
                                 except StopIteration:
                                     print('index overflow')
-                        print(big_constraint <= row_var)
                         mp.addConstr(big_constraint <= row_var, name='optimality cut')
                     # feasibility cut
                     else:
                         boundary_value = 0
                         for shadow_price in dual_variable:
                             plane_cutting_constraint.append()
-                    for node, para in g.nodes.data():
-                        if para['charger'] >= 0:
-                            pass
             elif mp.Status == GRB.Status.INFEASIBLE:
                 raise Exception('master problem infeasible')
             else:
                 raise Exception('sth went wrong')
 
-    def sub_problem(self, x_var_dict: tupledict) -> (list, int):
+        # print('row value' + str(row_var.X))
+        route = []
+        for edge in self.G.edges:
+            if x_var_dict[edge].X > 0.99:
+                route.append(edge)
+        print('total runtime of Bender\'s Composition Function : %2f s' % total_runtime)
+
+        sp_obj, charging_output = self.sub_problem(x_var_dict, obj_output=True)
+        minimum_obj_value = mp.ObjVal - row_var.X + sp_obj
+        print('optimal route is {0}'.format(route))
+        print('minimum cost of travelling is {0:d}'.format(int(minimum_obj_value)))
+        print('charging amount in each node: {0}'.format(charging_output))
+        return route, minimum_obj_value, charging_output
+
+    def sub_problem(self, x_var_dict: tupledict, obj_output=False):
         g = self.G
         sp = Model()
-        sp.Params.InfUnbdInfo = 1  # 设置后能输出极方向
+        # sp.Params.InfUnbdInfo = 1  # 设置后能输出极方向
+        sp.setParam('OutputFlag', 0)  # 不打印日志
         e_var_dict = sp.addVars(g.nodes, vtype=GRB.CONTINUOUS, name='e', ub=100, lb=0)
         s_var_dict = sp.addVars(g.nodes, vtype=GRB.CONTINUOUS, name='s', ub=100, lb=0)
 
@@ -440,11 +462,6 @@ class Bender_Decomposition:
                         sp.addConstr(s_var_dict[j] - s_var_dict[i] - e_var_dict[i] >= - ELEC_CONS_RATE * d - BIG_M * (
                                 1 - flow_in_edge), name=''))
 
-                # for i, j, d in g.in_edges(node, data='weight'):
-                #     if x_var_dict[(i, j)].X > 0.99:
-                #         constrs.append(sp.addConstr(
-                #             quicksum([s_var_dict[i], - ELEC_CONS_RATE * d, e_var_dict[i]]) == s_var_dict[node],
-                #             name='soc in node %d' % node))
             else:
                 # origin node power constraint
                 sp.addConstr(s_var_dict[node] == ELEC_CAPACITY, name='')
@@ -461,14 +478,18 @@ class Bender_Decomposition:
         # add benders_cut
         status = -1
         if sp.status == GRB.Status.OPTIMAL:
-            status = 0
-            dual_variable = []
-            for node in self.G.nodes:
-                if s_var_dict[node].X > 0.1:
-                    print(s_var_dict[node].X)
-            for constr in constrs:
-                dual_variable.append(constr.Pi)
-            return dual_variable, status
+            if not obj_output:
+                status = 0
+                dual_variable = []
+                for constr in constrs:
+                    dual_variable.append(constr.Pi)
+                return dual_variable, status, sp.Runtime
+            else:
+                charging_output = {}
+                for node in self.G.nodes:
+                    if s_var_dict[node].X > 0.1:
+                        charging_output[node] = e_var_dict[node].X
+                return sp.ObjVal, charging_output
         elif sp.status == GRB.Status.INFEASIBLE:
             # # not available for discontinuous model
             # raise Exception('MP is infeasible')
@@ -477,7 +498,7 @@ class Bender_Decomposition:
             raise Exception('opps')
             for constr in constrs:
                 extreme_dir.append(constr.FarkasDual)
-            return extreme_dir, status
+            return extreme_dir, status, sp.Runtime
         else:
             raise Exception('sth went wrong')
 
@@ -566,9 +587,7 @@ if __name__ == '__main__':
     raw_path['point1'] = raw_path['point1'].astype('int')
     raw_path['point2'] = raw_path['point2'].astype('int')
     network = NetWork(raw_node, raw_path)
-    # network.solve_single_by_gurobi()
-    # network.network_display()
-    # exit()
+    network.solve_single_by_gurobi()
     network.solve_by_benders_decomposition()
     exit()
     network.solve_alternative_by_gurobi()
