@@ -11,11 +11,11 @@ ELEC_CAPACITY = 100  # 电池容量
 ELEC_CONS_RATE = 0.2  # 每公里电量消耗率
 ELEC_MIN = 5  # 电池最小剩余量
 COST_PER_DIS = 0.5
-VALUE_OF_TIME = 0.5
+VALUE_OF_TIME = 50
 CHARGING_RATE = 0.1  # TODO:修正
 REPLACE_FEE = 0.01
 SPEED = 50
-BIG_M = 500
+BIG_M = 200
 
 
 def prompt_display(func):
@@ -88,7 +88,8 @@ class NetWork:
 
         # add objective function
         node_with_charger = [node[0] for node in g.nodes.data() if node[1]['charger'] == 1]
-        price_coeff = tupledict(map(lambda node: (node[0], node[1]['price'] + VALUE_OF_TIME / CHARGING_RATE), g.nodes.data()))
+        price_coeff = tupledict(
+            map(lambda node: (node[0], node[1]['price'] + VALUE_OF_TIME / CHARGING_RATE), g.nodes.data()))
         dis_coeff = tupledict(map(lambda edge: ((edge[0], edge[1]), edge[2]['weight'] * COST_PER_DIS), g.edges.data()))
         obj = e_var_dict.prod(price_coeff, node_with_charger) + x_var_dict.prod(dis_coeff, '*')
         m.setObjective(obj, GRB.MINIMIZE)
@@ -113,7 +114,7 @@ class NetWork:
                 # lower bound of SOC
                 m.addConstr(x_var_dict.sum('*', node) * ELEC_MIN <= s_var_dict[node],
                             name='minimum soc in node %d' % node)
-                m.addConstr(x_var_dict.sum('*', node) * BIG_M >= s_var_dict[node], name='')
+                m.addConstr(x_var_dict.sum('*', node) * ELEC_CAPACITY >= s_var_dict[node], name='')
 
                 # equation of SOC
                 expr_comp = []
@@ -190,7 +191,7 @@ class NetWork:
                 # lower bound of SOC
                 m.addConstr(x_var_dict.sum('*', node) * ELEC_MIN <= s_var_dict[node],
                             name='minimum soc in node %d' % node)
-                m.addConstr(x_var_dict.sum('*', node) * BIG_M >= s_var_dict[node], name='')
+                m.addConstr(x_var_dict.sum('*', node) * ELEC_CAPACITY >= s_var_dict[node], name='')
 
                 # equation of SOC
                 # expr_comp = []
@@ -283,7 +284,7 @@ class Bender_Decomposition:
         # master problem construction
         # variable
         x_var_dict = mp.addVars(g.edges, vtype=GRB.BINARY, name='x')
-        row_var = mp.addVar(vtype=GRB.CONTINUOUS, obj=1, lb=0, name='row', column=None)
+        row_var = mp.addVar(vtype=GRB.CONTINUOUS, obj=1, name='row', column=None)
 
         # objective function
         dis_coeff = tupledict(map(lambda edge: ((edge[0], edge[1]), edge[2]['weight'] * COST_PER_DIS), g.edges.data()))
@@ -312,6 +313,9 @@ class Bender_Decomposition:
             print('约束数量%d' % len(mp.getConstrs()))
             mp.optimize()
             print('row value' + str(row_var.X))
+            for edge in self.G.edges:
+                if x_var_dict[edge].X > 0.99:
+                    print(edge)
             print(mp.ObjVal)
             if mp.Status == GRB.Status.OPTIMAL:
                 # solve sub problem
@@ -325,30 +329,71 @@ class Bender_Decomposition:
                         '''
                         150个对偶变量
                         '''
+                        # for node, para in g.nodes.data():
+                        #     if para['charger'] >= 0:
+                        #         try:
+                        #             # lower bound of SOC
+                        #             var = next(dual_index)
+                        #             print('1:' + str(dual_variable[var]))
+                        #             mp.addConstr(
+                        #                 x_var_dict.sum('*', node) * ELEC_MIN * dual_variable[
+                        #                     var] <= row_var,
+                        #                 name='minimum soc in node %d' % node)
+                        #
+                        #             var = next(dual_index)
+                        #             print('2:' + str(dual_variable[var]))
+                        #             mp.addConstr(x_var_dict.sum('*', node) * BIG_M * dual_variable[
+                        #                 var] <= row_var, name='')
+                        #
+                        #             # equation of SOC
+                        #             for i, j, d in g.in_edges(node, data='weight'):
+                        #                 var = next(dual_index)
+                        #                 print('3:' + str(dual_variable[var]))
+                        #                 mp.addConstr(row_var >= dual_variable[var] * (BIG_M * (
+                        #                         1 - x_var_dict[(i, j)]) - ELEC_CONS_RATE * d), name='')
+                        #
+                        #                 var = next(dual_index)
+                        #                 print('4:' + str(dual_variable[var]))
+                        #                 mp.addConstr(row_var >= dual_variable[var] * (-BIG_M * (
+                        #                         1 - x_var_dict[(i, j)]) - ELEC_CONS_RATE * d), name='')
+                        #         except StopIteration:
+                        #             print('index overflow')
+                        #             pass
+                        big_constraint = LinExpr()
                         for node, para in g.nodes.data():
                             if para['charger'] >= 0:
                                 try:
                                     # lower bound of SOC
-                                    mp.addConstr(
-                                        x_var_dict.sum('*', node) * ELEC_MIN * dual_variable[
-                                            next(dual_index)] <= row_var,
-                                        name='minimum soc in node %d' % node)
-                                    mp.addConstr(x_var_dict.sum('*', node) * BIG_M * dual_variable[
-                                        next(dual_index)] <= row_var, name='')
+                                    var = next(dual_index)
+                                    print('1:' + str(dual_variable[var]))
+                                    big_constraint = big_constraint + x_var_dict.sum('*', node) * ELEC_MIN * \
+                                                     dual_variable[var]
+
+                                    var = next(dual_index)
+                                    print('2:' + str(dual_variable[var]))
+                                    big_constraint = big_constraint + x_var_dict.sum('*', node) * ELEC_CAPACITY * \
+                                                     dual_variable[var]
 
                                     # equation of SOC
                                     for i, j, d in g.in_edges(node, data='weight'):
-                                        mp.addConstr(row_var >= dual_variable[next(dual_index)] * (BIG_M * (
-                                                1 - x_var_dict[(i, j)]) - ELEC_CONS_RATE * d), name='')
-                                        mp.addConstr(row_var >= dual_variable[next(dual_index)] * (-BIG_M * (
-                                                1 - x_var_dict[(i, j)]) - ELEC_CONS_RATE * d), name='')
+                                        var = next(dual_index)
+                                        print('3:' + str(dual_variable[var]))
+
+                                        print(dual_variable[var] * (BIG_M * (
+                                                1 - x_var_dict[(i, j)]) - ELEC_CONS_RATE * d))
+                                        print(dual_variable[var])
+
+                                        big_constraint = big_constraint + dual_variable[var] * (BIG_M * (
+                                                1 - x_var_dict[(i, j)]) - ELEC_CONS_RATE * d)
+
+                                        var = next(dual_index)
+                                        print('4:' + str(dual_variable[var]))
+                                        big_constraint = big_constraint + dual_variable[var] * (-BIG_M * (
+                                                1 - x_var_dict[(i, j)]) - ELEC_CONS_RATE * d)
                                 except StopIteration:
                                     print('index overflow')
-                                    pass
-                        for edge in self.G.edges:
-                            if x_var_dict[edge].X > 0.99:
-                                print(edge)
-
+                        print(big_constraint <= row_var)
+                        mp.addConstr(big_constraint <= row_var, name='optimality cut')
                     # feasibility cut
                     else:
                         boundary_value = 0
@@ -383,16 +428,16 @@ class Bender_Decomposition:
                 # lower bound of SOC
                 constrs.append(
                     sp.addConstr(node_indicator * ELEC_MIN <= s_var_dict[node], name='minimum soc in node %d' % node))
-                constrs.append(sp.addConstr(node_indicator * BIG_M >= s_var_dict[node], name=''))
+                constrs.append(sp.addConstr(node_indicator * ELEC_CAPACITY >= s_var_dict[node], name=''))
 
                 # equation of SOC
                 for i, j, d in g.in_edges(node, data='weight'):
                     flow_in_edge = 1 if x_var_dict[(i, j)].X > 0.99 else 0
                     constrs.append(
-                        sp.addConstr(s_var_dict[j] - s_var_dict[i] <= e_var_dict[i] - ELEC_CONS_RATE * d + BIG_M * (
+                        sp.addConstr(s_var_dict[j] - s_var_dict[i] - e_var_dict[i] <= - ELEC_CONS_RATE * d + BIG_M * (
                                 1 - flow_in_edge), name=''))
                     constrs.append(
-                        sp.addConstr(s_var_dict[j] - s_var_dict[i] >= e_var_dict[i] - ELEC_CONS_RATE * d - BIG_M * (
+                        sp.addConstr(s_var_dict[j] - s_var_dict[i] - e_var_dict[i] >= - ELEC_CONS_RATE * d - BIG_M * (
                                 1 - flow_in_edge), name=''))
 
                 # for i, j, d in g.in_edges(node, data='weight'):
@@ -422,7 +467,6 @@ class Bender_Decomposition:
                 if s_var_dict[node].X > 0.1:
                     print(s_var_dict[node].X)
             for constr in constrs:
-                # print(constr.getAttr('ConstrName') + str(constr.Pi))
                 dual_variable.append(constr.Pi)
             return dual_variable, status
         elif sp.status == GRB.Status.INFEASIBLE:
@@ -430,6 +474,7 @@ class Bender_Decomposition:
             # raise Exception('MP is infeasible')
             status = 1
             extreme_dir = []
+            raise Exception('opps')
             for constr in constrs:
                 extreme_dir.append(constr.FarkasDual)
             return extreme_dir, status
